@@ -1,0 +1,20 @@
+# meta
+.vscode/
+__pycache__/
+
+# data
+data/
+
+# pretrained
+pretrained/
+
+# ref
+ref/
+
+# generated
+gen/
+out/
+
+# logs
+log/
+*.log
