@@ -50,7 +50,7 @@ def train(rank:int, a:Namespace, h:Namespace):
     msd = MultiScaleDiscriminator().to(device)
 
     if rank == 0:
-        #print(generator)
+        print(generator)
         print('>> param_cnt:', sum([p.numel() for p in generator.parameters() if p.requires_grad]))
 
     ''' Ckpt '''

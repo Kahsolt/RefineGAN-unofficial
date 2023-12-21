@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from audio import load_wav, normalize, mel_spectrogram, FFTParams
+from audio import load_wav, normalize, random_pitch_shift, random_energy_rescale, mel_spectrogram, FFTParams
 
 
 def get_dataset_filelist(a) -> Tuple[List[Path], List[Path]]:
@@ -43,6 +43,10 @@ class MelDataset(Dataset):
             wav = torch.from_numpy(wav).unsqueeze(0)    # [B=1, T]
             self.cache[index] = wav
         wav = self.cache[index]
+
+        if not 'data_aug':
+            wav = random_pitch_shift(wav)
+            wav = random_energy_rescale(wav)
 
         if self.split:
             wavlen = wav.size(dim=1)

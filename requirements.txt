@@ -1,5 +1,6 @@
 librosa
 soundfile
+pyworld
 scipy
 tensorboardX
 matplotlib
