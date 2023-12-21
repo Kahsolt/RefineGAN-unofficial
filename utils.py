@@ -1,21 +1,18 @@
 import os
 import glob
+import json
 import random
 import shutil
 from pathlib import Path
+from argparse import Namespace
 from typing import *
 
 import torch
 import numpy as np
+from numpy import ndarray
 import matplotlib as mpl; mpl.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-
-device = 'cuda' if torch.cuda.is_available() else torch.device('cpu')
-
-if torch.cuda.is_available():
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
 
 
 def seed_everything(seed:int=42):
@@ -26,17 +23,23 @@ def seed_everything(seed:int=42):
         torch.cuda.manual_seed_all(seed)
 
 
-def copy_config(config, config_name, path):
-    t_path = os.path.join(path, config_name)
-    if config != t_path:
-        os.makedirs(path, exist_ok=True)
-        shutil.copyfile(config, os.path.join(path, config_name))
+def copy_config(fp_src:str, fp_dst:str):
+    if fp_src == fp_dst: return
+    os.makedirs(os.path.dirname(fp_dst), exist_ok=True)
+    shutil.copyfile(fp_src, fp_dst)
 
 
-def plot_spectrogram(spectrogram) -> Figure:
+def load_config(fp:Path) -> Namespace:
+    with open(fp, 'r', encoding='utf-8') as fh:
+        data = fh.read()
+    cfg = json.loads(data)
+    return Namespace(**cfg)
+
+
+def plot_spectrogram(melspec:ndarray) -> Figure:
     plt.clf()
     fig, ax = plt.subplots(figsize=(10, 2))
-    im = ax.imshow(spectrogram, aspect='auto', origin='lower', interpolation='none')
+    im = ax.imshow(melspec, aspect='auto', origin='lower', interpolation='none')
     plt.colorbar(im, ax=ax)
     fig.canvas.draw()
     return fig

@@ -1,5 +1,3 @@
-from typing import List, Union
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,7 +89,7 @@ class Generator(nn.Module):
         for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
             self.ups.append(weight_norm(ConvTranspose1d(h.upsample_initial_channel//(2**i), h.upsample_initial_channel//(2**(i+1)), k, u, padding=(k-u)//2)))
 
-        self.resblocks: List[Union[ResBlock1, ResBlock2]] = nn.ModuleList()
+        self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = h.upsample_initial_channel//(2**(i+1))
             for j, (k, d) in enumerate(zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)):
@@ -197,13 +195,13 @@ class DiscriminatorS(nn.Module):
 
         norm_f = weight_norm if use_spectral_norm == False else spectral_norm
         self.convs = nn.ModuleList([
-            norm_f(Conv1d(1, 128, 15, 1, padding=7)),
-            norm_f(Conv1d(128, 128, 41, 2, groups=4, padding=20)),
-            norm_f(Conv1d(128, 256, 41, 2, groups=16, padding=20)),
-            norm_f(Conv1d(256, 512, 41, 4, groups=16, padding=20)),
-            norm_f(Conv1d(512, 1024, 41, 4, groups=16, padding=20)),
+            norm_f(Conv1d(1,    128,  15, 1, padding=7)),
+            norm_f(Conv1d(128,  128,  41, 2, groups=4,  padding=20)),
+            norm_f(Conv1d(128,  256,  41, 2, groups=16, padding=20)),
+            norm_f(Conv1d(256,  512,  41, 4, groups=16, padding=20)),
+            norm_f(Conv1d(512,  1024, 41, 4, groups=16, padding=20)),
             norm_f(Conv1d(1024, 1024, 41, 1, groups=16, padding=20)),
-            norm_f(Conv1d(1024, 1024, 5, 1, padding=2)),
+            norm_f(Conv1d(1024, 1024,  5, 1, padding=2)),
         ])
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 

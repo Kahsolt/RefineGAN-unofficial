@@ -1,4 +1,6 @@
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
@@ -6,22 +8,27 @@ from torch import Tensor
 import numpy as np
 from numpy import ndarray
 from numpy.typing import NDArray
-from scipy.io.wavfile import read as read_wav, write as write_wav
+from scipy.io.wavfile import write as write_wav
+from librosa.core import load
 from librosa.util import normalize
 from librosa.filters import mel as mel_filter
-from librosa.core import resample, load
-
-MAX_WAV_VALUE = 32768.0
 
 Wav = NDArray[np.float32]   # vrng norm to [-1, 1]
 
 
+@dataclass
+class FFTParams:
+    sr: int
+    n_fft: int
+    n_mel: int
+    hop_size: int
+    win_size: int
+    fmin: int
+    fmax: int
+
+
 def load_wav(fp:Path, sr:int=None) -> Wav:
-    sr_orig, wav = read_wav(fp)
-    wav = wav / MAX_WAV_VALUE
-    wav = wav.astype(np.float32)
-    if sr and sr != sr_orig:
-        wav = resample(wav, sr_orig, sr, res_type='kaiser_best', fix=True, scale=True)
+    wav, sr = load(fp, sr=sr, res_type='kaiser_best', dtype=np.float32)
     return wav
 
 
@@ -29,49 +36,66 @@ def save_wav(fp:Path, wav:Wav, sr:int):
     if wav.min() < -1 or wav.max() > 1:
         print(f'>> warn: clip wav vrng [{wav.min()} ,{wav.max()}] => [-1, 1]')
         wav = wav.clip(-1.0, 1.0)
-    wav = wav * MAX_WAV_VALUE
-    wav = wav.astype(np.int16)
     write_wav(fp, sr, wav)
 
 
-def dynamic_range_compression(x, C=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
+def dynamic_range_compression(x:ndarray, C:float=1, eps:float=1e-5) -> ndarray:
+    return np.log(np.clip(x, a_min=eps, a_max=None) * C)
 
 
-def dynamic_range_decompression(x, C=1):
+def dynamic_range_decompression(x:ndarray, C:float=1) -> ndarray:
     return np.exp(x) / C
 
 
-def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * C)
+def dynamic_range_compression_torch(x:Tensor, C:float=1, eps:float=1e-5) -> Tensor:
+    return torch.log(torch.clamp(x, min=eps) * C)
 
 
-def dynamic_range_decompression_torch(x, C=1):
+def dynamic_range_decompression_torch(x:Tensor, C:float=1) -> Tensor:
     return torch.exp(x) / C
 
 
-mel_basis = {}
-hann_window = {}
+mel_basis: Dict[str, Tensor] = {}
+window_func: Dict[str, Tensor] = {}
 
-def mel_spectrogram(y:Tensor, n_fft:int, n_mels:int, sampling_rate:int, hop_size:int, win_size:int, fmin:int, fmax:int) -> Tensor:
-    if torch.min(y) < -1.0: print('min value is:', torch.min(y))
-    if torch.max(y) > +1.0: print('max value is:', torch.max(y))
+def mel_spectrogram(y:Tensor, h:FFTParams) -> Tensor:
+    assert len(y.shape), f'>> y.shape should be like [B, T], but got {tuple(y.shape)}'
+    if y.min() < -1.0 or y.max() > 1.0:
+        print(f'warn: wav vrng is [{y.min()}, {y.max()}]')
 
-    global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = mel_filter(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
-        mel_basis[f'{fmax}_{y.device}'] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
-    window = hann_window[str(y.device)]
-    basis = mel_basis[f'{fmax}_{y.device}']
+    global mel_basis, window_func
+    win_fn_name = str(y.device)
+    mel_fn_name = f'{y.device}_{h.fmax}'
+    if mel_fn_name not in mel_basis:
+        mel = mel_filter(sr=h.sr, n_fft=h.n_fft, n_mels=h.n_mel, fmin=h.fmin, fmax=h.fmax)
+        mel_basis[mel_fn_name] = torch.from_numpy(mel).float().to(y.device)
+        window_func[win_fn_name] = torch.hann_window(h.win_size).to(y.device)
+    window = window_func[win_fn_name]
+    basis = mel_basis[mel_fn_name]
 
-    P = (n_fft - hop_size) // 2
-    y = y.unsqueeze(1)
-    y = F.pad(y, (P, P), mode='reflect')
-    y = y.squeeze(dim=1)
+    '''
+    # https://pytorch.org/docs/stable/generated/torch.stft.html
+    torch.stft is wired about input/output length when center=True:
+        len_out = 1 + len_in // hop_length
+    hence we have:
+        wav: [B=1, T=128] => spec(hop_length=128): [B=1, F, L=2]
+        wav: [B=1, T=127] => spec(hop_length=128): [B=1, M, L=1]
+    '''
+    wavlen = y.shape[-1]
+    if wavlen % h.hop_size == 0:
+        y = y[:, 1:]       # remove one sample to align with k*hop_size-1
+    else:
+        pass
+        # safe to ignore
+        # n_seg = int(np.ceil(wavlen / h.hop_size))
+        # tgtlen = n_seg * h.hop_size - 1
+        # difflen = tgtlen - wavlen
+        # y = y.unsqueeze(dim=1)      # [B, C=1, T]
+        # y = F.pad(y, (difflen//2, difflen-difflen//2), mode='reflect')
+        # y = y.squeeze(dim=1)        # [B, T]
 
-    spec = torch.stft(y, n_fft, hop_size, win_size, window, onesided=True, return_complex=True)
-    spec = torch.abs(spec)  # modulo (magintude)
-    spec = torch.matmul(basis, spec)
-    spec = dynamic_range_compression_torch(spec)
-    return spec
+    spec = torch.stft(y, h.n_fft, h.hop_size, h.win_size, window, center=True, onesided=True, return_complex=True)
+    mag = torch.abs(spec)   # modulo
+    mel = torch.matmul(basis, mag)
+    mel = dynamic_range_compression_torch(mel)
+    return mel

@@ -17,12 +17,13 @@ The RefineGAN [https://arxiv.org/abs/2111.00962](https://arxiv.org/abs/2111.0096
 
 ⚪ inference
 
-- `python infer.py`
+- `python infer.py pretrained/UNIVERSAL_V1/g_02500000`
+- `python infer.py pretrained/LJ_V3/generator_v3`
 
-⚪ train
+⚪ train (refine)
 
-- download the HiFiGAN repo provided [pretrained weights](https://drive.google.com/drive/folders/1-eEYTB5Av9jNql0WGBlRoi-WH2J7bp5Y?usp=sharing)
-- `python train.py`
+- download the HiFiGAN repo provided [pretrained checkpoints](https://drive.google.com/drive/folders/1-eEYTB5Av9jNql0WGBlRoi-WH2J7bp5Y?usp=sharing)
+- `python train.py -c configs/config_v1.refine.json --load pretrained/UNIVERSAL_V1 --log_path log/test`
 
 
 #### reference
