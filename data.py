@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from audio import load_wav, normalize, random_pitch_shift, random_energy_rescale, mel_spectrogram, FFTParams
+from audio import load_wav, normalize, speech_template_approx_from_wav, random_pitch_shift, random_energy_rescale, mel_spectrogram, FFTParams
 
 
 def get_dataset_filelist(a) -> Tuple[List[Path], List[Path]]:
@@ -21,12 +21,13 @@ def get_dataset_filelist(a) -> Tuple[List[Path], List[Path]]:
 
 class MelDataset(Dataset):
 
-    def __init__(self, fps:List[Path], segment_size:int, fft_param:FFTParams, fft_param_for_loss:FFTParams=None, split:bool=True, shuffle:bool=False, device:str=None):
+    def __init__(self, fps:List[Path], segment_size:int, fft_param:FFTParams, fft_param_for_loss:FFTParams=None, split:bool=True, wav_tmpl:bool=False, shuffle:bool=False, device:str=None):
         self.fps = fps
         self.segment_size = segment_size
         self.fft_param = fft_param
         self.fft_param_for_loss = fft_param_for_loss or fft_param
         self.split = split
+        self.wav_tmpl = wav_tmpl
         self.device = device or 'cpu'
 
         if shuffle: random.shuffle(self.fps)
@@ -61,5 +62,11 @@ class MelDataset(Dataset):
         mel_lowpass = mel_spectrogram(wav, self.fft_param)
         mel_full = mel_spectrogram(wav, self.fft_param_for_loss)
 
-        # [M=80, L=32], [T=8192], [M=80, L=32]
-        return mel_lowpass.squeeze(), wav.squeeze(), mel_full.squeeze()
+        if self.wav_tmpl:
+            wav_tmpl = speech_template_approx_from_wav(wav.squeeze().numpy(), self.fft_param_for_loss)
+            wav_tmpl = torch.from_numpy(wav_tmpl).float()
+            # [M=80, L=32], [T=8192], [T=8192], [M=80, L=32]
+            return mel_lowpass.squeeze(), wav.squeeze(), wav_tmpl, mel_full.squeeze()
+        else:
+            # [M=80, L=32], [T=8192], [M=80, L=32]
+            return mel_lowpass.squeeze(), wav.squeeze(), mel_full.squeeze()

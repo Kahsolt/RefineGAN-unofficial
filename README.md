@@ -7,6 +7,11 @@
 The [RefineGAN](https://arxiv.org/abs/2111.00962) vocoder sounds great, let's try to reproduce it!  
 ℹ it seems to be highly inspired by HiFiGAN, UnivNet & UNet 🎉  
 
+| Model | param_cnt | train b/s |
+| :-: | :-: | :-: |
+| HiFiGAN-v1 | 13936130 |  |
+| RefineGAN  | 18962066 |  |
+
 
 ### Quickstart
 
@@ -23,8 +28,14 @@ The [RefineGAN](https://arxiv.org/abs/2111.00962) vocoder sounds great, let's tr
 
 ⚪ train (refine)
 
+train HiFiGAN:
+
 - download the HiFiGAN repo provided [pretrained checkpoints](https://drive.google.com/drive/folders/1-eEYTB5Av9jNql0WGBlRoi-WH2J7bp5Y?usp=sharing)
 - `python train.py -c configs/config_v1.refine.json --load pretrained/UNIVERSAL_V1 --log_path log/test`
+
+train RefineGAN:
+
+- `python train_refinegan.py -c configs/refinegan.json --log_path log/refinegan`
 
 
 #### reference

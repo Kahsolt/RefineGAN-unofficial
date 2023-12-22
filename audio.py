@@ -1,7 +1,7 @@
 import random
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Union
 
 import torch
 import torch.nn.functional as F
@@ -70,12 +70,13 @@ def mel_spectrogram(y:Tensor, h:FFTParams) -> Tensor:
         print(f'warn: wav vrng is [{y.min()}, {y.max()}]')
 
     global mel_basis, window_func
-    win_fn_name = str(y.device)
-    mel_fn_name = f'{y.device}_{h.fmax}'
+    win_fn_name = f'{y.device}_{h.win_size}'
+    mel_fn_name = f'{y.device}_{h.n_fft}_{h.n_mel}_{h.fmin}_{h.fmax}'
+    if win_fn_name not in window_func:
+        window_func[win_fn_name] = torch.hann_window(h.win_size, dtype=y.dtype).to(y.device)
     if mel_fn_name not in mel_basis:
-        mel = mel_filter(sr=h.sr, n_fft=h.n_fft, n_mels=h.n_mel, fmin=h.fmin, fmax=h.fmax)
-        mel_basis[mel_fn_name] = torch.from_numpy(mel).float().to(y.device)
-        window_func[win_fn_name] = torch.hann_window(h.win_size).to(y.device)
+        mel_mat = mel_filter(sr=h.sr, n_fft=h.n_fft, n_mels=h.n_mel, fmin=h.fmin, fmax=h.fmax)
+        mel_basis[mel_fn_name] = torch.from_numpy(mel_mat).to(y.device, y.dtype)
     window = window_func[win_fn_name]
     basis = mel_basis[mel_fn_name]
 
@@ -83,22 +84,11 @@ def mel_spectrogram(y:Tensor, h:FFTParams) -> Tensor:
     # https://pytorch.org/docs/stable/generated/torch.stft.html
     torch.stft is wired about input/output length when center=True:
         len_out = 1 + len_in // hop_length
-    hence we have:
-        wav: [B=1, T=128] => spec(hop_length=128): [B=1, F, L=2]
-        wav: [B=1, T=127] => spec(hop_length=128): [B=1, M, L=1]
+    hence we have (when hop_length=128):
+        wav: [B=1, T=128] => spec: [B=1, F, L=2]
+        wav: [B=1, T=127] => spec: [B=1, F, L=1]
     '''
-    wavlen = y.shape[-1]
-    if wavlen % h.hop_size == 0:
-        y = y[:, 1:]       # remove one sample to align with k*hop_size-1
-    else:
-        pass
-        # safe to ignore
-        # n_seg = int(np.ceil(wavlen / h.hop_size))
-        # tgtlen = n_seg * h.hop_size - 1
-        # difflen = tgtlen - wavlen
-        # y = y.unsqueeze(dim=1)      # [B, C=1, T]
-        # y = F.pad(y, (difflen//2, difflen-difflen//2), mode='reflect')
-        # y = y.squeeze(dim=1)        # [B, T]
+    y = align_wavlen(y, h.hop_size)
 
     spec = torch.stft(y, h.n_fft, h.hop_size, h.win_size, window, onesided=True, return_complex=True)
     mag = torch.abs(spec)   # modulo
@@ -130,6 +120,13 @@ def harveset(y:ndarray, fs:int=22050, hop:int=256, f0_min:float=55.0, f0_max:flo
 
 PITCH_LOW_CUT = 20.0     # NOTE: lower hearing threshold
 
+def align_wavlen(y:Union[ndarray, Tensor], hop_size:FFTParams) -> Union[ndarray, Tensor]:
+    # remove one sample to align with k*hop_size-1
+    wavlen = y.shape[-1]
+    if wavlen % hop_size == 0:
+        y = y[..., 1:]
+    return y
+
 def align_f0_c0(f0:ndarray, c0:ndarray) -> tuple[ndarray, ndarray]:
     len_f0, len_c0 = len(f0), len(c0)
     d = len_f0 - len_c0
@@ -137,7 +134,7 @@ def align_f0_c0(f0:ndarray, c0:ndarray) -> tuple[ndarray, ndarray]:
     elif d < 0: f0 = np.pad(f0, (0, -d), mode='constant', constant_values=0.0)
     return f0, c0
 
-def make_pulses(f0:ndarray, c0:ndarray, hop_size:int):
+def make_pulses(f0:ndarray, c0:ndarray, hop_size:int) -> ndarray:
     from numpy import pi
     pulses = []
     for i in range(len(f0)):
@@ -150,9 +147,9 @@ def make_pulses(f0:ndarray, c0:ndarray, hop_size:int):
             t = np.arange(0, T,  T / hop_size)
             pulse = A * np.sin(2 * pi * F * t + pi / 2)
         pulses.append(pulse)
-    return np.concatenate(pulses, axis=0)
+    return np.concatenate(pulses, axis=0, dtype=np.float32)
 
-def make_noises(f0:ndarray, c0:ndarray, hop_size:int):
+def make_noises(f0:ndarray, c0:ndarray, hop_size:int) -> ndarray:
     noises = []
     for i in range(len(f0)):
         F = f0[i]
@@ -162,7 +159,7 @@ def make_noises(f0:ndarray, c0:ndarray, hop_size:int):
             A = c0[i] * np.sqrt(2)
             noise = A * np.random.uniform(-1, 1, size=hop_size)
         noises.append(noise)
-    return np.concatenate(noises, axis=0)
+    return np.concatenate(noises, axis=0, dtype=np.float32)
 
 def speech_template(pitch:ndarray, energy:ndarray, h:FFTParams) -> ndarray:
     assert len(pitch.shape) == len(energy.shape) == 1, f'>> need 1-D arrays but got: pitch {pitch.shape}, energy {energy.shape}'
@@ -182,6 +179,7 @@ def speech_template(pitch:ndarray, energy:ndarray, h:FFTParams) -> ndarray:
     return template
 
 def speech_template_approx_from_wav(y:ndarray, h:FFTParams) -> ndarray:
+    y = align_wavlen(y, h.hop_size)
     f0 = harveset(y, fs=h.sr, hop=h.hop_size, f0_min=h.f0min, f0_max=h.f0max)
     c0 = rms_energy(y=y, frame_length=h.win_size, hop_length=h.hop_size)[0]
     f0, c0 = align_f0_c0(f0, c0)
@@ -189,6 +187,7 @@ def speech_template_approx_from_wav(y:ndarray, h:FFTParams) -> ndarray:
 
 def speech_template_approx_from_spec(S:ndarray, h:FFTParams, gl_iter:int=12) -> ndarray:
     y_gl = griffinlim(S, n_iter=gl_iter, hop_length=h.hop_size, win_length=h.win_size, n_fft=h.n_fft, window='hann')
+    y_gl = align_wavlen(y_gl, h.hop_size)
     f0 = harveset(y_gl, fs=h.sr, hop=h.hop_size, f0_min=h.f0min, f0_max=h.f0max)
     f0 = gaussian_filter1d(f0, sigma=1, axis=-1, mode='reflect')
     c0 = rms_energy(S=S, frame_length=h.win_size, hop_length=h.hop_size)[0]
@@ -215,6 +214,7 @@ if __name__ == '__main__':
         f0max=1100,
     )
     y = load_wav('test/000001.wav', h.sr)
+    y = y[12000:12000+16384-1]
     S = stft(y, n_fft=h.n_fft, hop_length=h.hop_size, win_length=h.win_size, window='hann')
     M = melspectrogram(S=S, sr=h.sr, n_fft=h.n_fft, hop_length=h.hop_size, win_length=h.win_size, window='hann', power=1.0)
     tmpl_y = speech_template_approx_from_wav(y, h)
@@ -222,9 +222,9 @@ if __name__ == '__main__':
     tmpl_M = speech_template_approx_from_melspec(M, h)
 
     plt.clf()
-    plt.subplot(411) ; plt.title('y')      ; plt.plot(y)
-    plt.subplot(412) ; plt.title('tmpl_y') ; plt.plot(tmpl_y)
-    plt.subplot(413) ; plt.title('tmpl_S') ; plt.plot(tmpl_S)
-    plt.subplot(414) ; plt.title('tmpl_M') ; plt.plot(tmpl_M)
+    plt.subplot(411) ; plt.title(f'y (len={len(y)})')           ; plt.plot(y)
+    plt.subplot(412) ; plt.title(f'tmpl_y (len={len(tmpl_y)})') ; plt.plot(tmpl_y)
+    plt.subplot(413) ; plt.title(f'tmpl_S (len={len(tmpl_S)})') ; plt.plot(tmpl_S)
+    plt.subplot(414) ; plt.title(f'tmpl_M (len={len(tmpl_M)})') ; plt.plot(tmpl_M)
     plt.tight_layout()
     plt.show()

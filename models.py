@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,7 +7,7 @@ from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from torch import Tensor
 
-from audio import mel_spectrogram
+from audio import mel_spectrogram, FFTParams
 
 LRELU_SLOPE = 0.1
 
@@ -337,8 +339,14 @@ class MultiResolutionDiscriminator(nn.Module):
             DiscriminatorR(resolution) for resolution in self.resolutions
         ])
 
-    def forward(self, x):
-        return [disc(x) for disc in self.discriminators]
+    def forward(self, y, y_hat):
+        y_d_rs, y_d_gs = [], []
+        for disc in self.discriminators:
+           _, y_d_r = disc(y)
+           _, y_d_g = disc(y_hat)
+           y_d_rs.append(y_d_r)
+           y_d_gs.append(y_d_g)
+        return y_d_rs, y_d_gs
 
 
 ''' ↓↓↓ RefineGAN ↓↓↓ '''
@@ -436,13 +444,33 @@ def envelope_loss(y, y_g):
   return loss
 
 
-def multi_param_melspec_loss(y, y_g, multi_stft_params):
+def multi_param_melspec_loss(y, y_g, multi_stft_params, h:FFTParams):
     loss = 0
     for n_fft, win_length, hop_length in multi_stft_params:
-        y_mel   = mel_spectrogram(y,   n_fft, win_length, hop_length)
-        y_g_mel = mel_spectrogram(y_g, n_fft, win_length, hop_length)
+        h_tmp = deepcopy(h)
+        h_tmp.n_fft = n_fft
+        h_tmp.win_size = win_length
+        h_tmp.hop_size = hop_length
+        y_mel   = mel_spectrogram(y,   h_tmp)
+        y_g_mel = mel_spectrogram(y_g, h_tmp)
         loss += F.l1_loss(y_mel, y_g_mel)
     return loss / len(multi_stft_params)
+
+
+def refinegan_generator_loss(disc_outputs):
+    loss = 0
+    for dg in disc_outputs:
+        loss += torch.log1p(torch.exp(-dg)).mean()
+    return loss / len(disc_outputs)
+
+
+def refinegan_discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    loss = 0
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        r_loss = torch.log1p(torch.exp(-dr)).mean()
+        g_loss = torch.log1p(torch.exp(dg)).mean()
+        loss += (r_loss + g_loss)
+    return loss / len(disc_real_outputs)
 
 
 ''' ↓↓↓ RetuneGAN ↓↓↓ '''

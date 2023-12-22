@@ -1,28 +1,5 @@
-import warnings ; warnings.simplefilter(action='ignore', category=FutureWarning)
-
-import os
-from time import time
-from itertools import chain
-from argparse import ArgumentParser, Namespace
-
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DistributedSampler, DataLoader
-from torch.optim.lr_scheduler import ExponentialLR
-from torch.optim import AdamW
-import torch.multiprocessing as mp
-from torch.distributed import init_process_group
-from torch.nn.parallel import DistributedDataParallel
-from tensorboardX import SummaryWriter
-
-from data import MelDataset, mel_spectrogram, get_dataset_filelist
-from audio import FFTParams
-from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss, discriminator_loss
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, copy_config, load_config, seed_everything
-
-assert torch.cuda.is_available(), '>> you must have GPU with cuda to train!!'
-torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
+from models import Refiner, MultiResolutionDiscriminator, multi_param_melspec_loss, envelope_loss, refinegan_generator_loss, refinegan_discriminator_loss
+from train import *
 
 
 def train(rank:int, a:Namespace, h:Namespace):
@@ -45,9 +22,9 @@ def train(rank:int, a:Namespace, h:Namespace):
         sw = SummaryWriter(os.path.join(a.log_path, 'logs'))
 
     ''' Model '''
-    generator = Generator(h).to(device)
+    generator = Refiner(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
+    mrd = MultiResolutionDiscriminator().to(device)
 
     if rank == 0:
         print(generator)
@@ -75,18 +52,18 @@ def train(rank:int, a:Namespace, h:Namespace):
             print('>> found discriminator & optimizer ckpt:', cp_do)
             state_dict_do = load_checkpoint(cp_do, device)
             mpd.load_state_dict(state_dict_do['mpd'])
-            msd.load_state_dict(state_dict_do['msd'])
+            mrd.load_state_dict(state_dict_do['mrd'])
             steps = state_dict_do['steps'] + 1
             last_epoch = state_dict_do['epoch']
 
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+        mrd = DistributedDataParallel(mrd, device_ids=[rank]).to(device)
 
     ''' Optimizer & Scheduler '''
     optim_g = AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
-    optim_d = AdamW(chain(msd.parameters(), mpd.parameters()), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_d = AdamW(chain(mrd.parameters(), mpd.parameters()), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
 
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
@@ -99,18 +76,18 @@ def train(rank:int, a:Namespace, h:Namespace):
     train_filelist, valid_filelist = get_dataset_filelist(a)
     fft_param = FFTParams(sr=h.sampling_rate, n_fft=h.n_fft, n_mel=h.num_mels, hop_size=h.hop_size, win_size=h.win_size, fmin=h.fmin, fmax=h.fmax)
     fft_param_for_loss = FFTParams(sr=h.sampling_rate, n_fft=h.n_fft, n_mel=h.num_mels, hop_size=h.hop_size, win_size=h.win_size, fmin=h.fmin, fmax=h.fmax_for_loss)
-    trainset = MelDataset(train_filelist, h.segment_size, fft_param, fft_param_for_loss, split=True, shuffle=False if h.num_gpus > 1 else True, device=device)
+    trainset = MelDataset(train_filelist, h.segment_size, fft_param, fft_param_for_loss, split=True, wav_tmpl=True, shuffle=False if h.num_gpus > 1 else True, device=device)
     sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
     trainloader = DataLoader(trainset, batch_size=h.batch_size, shuffle=False, sampler=sampler, num_workers=h.num_workers, pin_memory=True, drop_last=True)
     if rank == 0:
-        validset = MelDataset(valid_filelist, h.segment_size, fft_param, fft_param_for_loss, split=False, shuffle=False, device=device)
+        validset = MelDataset(valid_filelist, h.segment_size, fft_param, fft_param_for_loss, split=False, wav_tmpl=True, shuffle=False, device=device)
         validloader = DataLoader(validset, batch_size=1, shuffle=False, sampler=None, num_workers=1, pin_memory=True, drop_last=False)
     melspec_full = lambda y: mel_spectrogram(y, fft_param_for_loss)
 
     ''' Train '''
     generator.train()
     mpd.train()
-    msd.train()
+    mrd.train()
     for epoch in range(max(0, last_epoch), a.epochs):
         if rank == 0:
             ts_epoch = time()
@@ -119,37 +96,37 @@ def train(rank:int, a:Namespace, h:Namespace):
         if h.num_gpus > 1:
             sampler.set_epoch(epoch)
 
-        for x, y, y_mel in trainloader:
+        for x, y, y_tmpl, y_mel in trainloader:
             if rank == 0: ts_batch = time()
 
-            x     = x    .to(device, non_blocking=True)     # [B=16, M=80, L=32], mel_input (low-band melspec)
-            y_mel = y_mel.to(device, non_blocking=True)     # [B=16, M=80, L=32], mel_tagret (full-band melspec)
-            y     = y    .to(device, non_blocking=True).unsqueeze(1)    # [B=16, C=1, T=8192]
+            x      = x     .to(device, non_blocking=True)               # [B=16, M=80, L=32], mel_input (low-band melspec)
+            y_tmpl = y_tmpl.to(device, non_blocking=True).unsqueeze(1)  # [B=16, C=1, T=8192]
+            y_mel  = y_mel .to(device, non_blocking=True)               # [B=16, M=80, L=32], mel_tagret (full-band melspec)
+            y      = y     .to(device, non_blocking=True).unsqueeze(1)  # [B=16, C=1, T=8192]
 
-            y_hat = generator(x)    # [B=16, C=1, T=8192]
+            y_hat = generator(x, y_tmpl)    # [B=16, C=1, T=8192]
             y_hat_mel = melspec_full(y_hat.squeeze(1))   # [B=16, M=80, L=32]
 
             # Discriminator
             optim_d.zero_grad()
-            y_g_hat_detach = y_hat.detach()
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat_detach)
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat_detach)
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-            loss_disc_all = loss_disc_s + loss_disc_f
+            y_hat_detach = y_hat.detach()
+            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_hat_detach)
+            loss_disc_f = refinegan_discriminator_loss(y_df_hat_r, y_df_hat_g)
+            y_dr_hat_r, y_dr_hat_g = mrd(y, y_hat_detach)
+            loss_disc_r = refinegan_discriminator_loss(y_dr_hat_r, y_dr_hat_g)
+            loss_disc_all = loss_disc_f + loss_disc_r
             loss_disc_all.backward()
             optim_d.step()
 
             # Generator
             optim_g.zero_grad()
-            loss_mel = F.l1_loss(y_mel, y_hat_mel)
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + (loss_fm_s + loss_fm_f) + loss_mel * 45
+            loss_mstft = multi_param_melspec_loss(y.squeeze(1), y_hat.squeeze(1), mrd.resolutions, fft_param_for_loss)
+            loss_env = envelope_loss(y, y_hat)
+            _, y_df_hat_g, _, _ = mpd(y, y_hat)
+            _, y_dr_hat_g = mrd(y, y_hat)
+            loss_gen_f = refinegan_generator_loss(y_df_hat_g)
+            loss_gen_r = refinegan_generator_loss(y_dr_hat_g)
+            loss_gen_all = (loss_gen_f + loss_gen_r) + loss_env + loss_mstft * 45   # NOTE: how much is λ?
             loss_gen_all.backward()
             optim_g.step()
 
@@ -157,11 +134,11 @@ def train(rank:int, a:Namespace, h:Namespace):
 
             if rank == 0:
                 if steps % a.stdout_interval == 0:
-                    print(f'>> [Steps {steps:d}] loss_gen: {loss_gen_all.item():4.3f}, loss_mel: {loss_mel.item():4.3f} ({time() - ts_batch:4.3f}s/b)')
+                    print(f'>> [Steps {steps:d}] loss_gen: {loss_gen_all.item():4.3f}, loss_mstft: {loss_mstft.item():4.3f} ({time() - ts_batch:4.3f}s/b)')
 
                 if steps % a.summary_interval == 0:
                     sw.add_scalar('train/loss_gen', loss_gen_all.item(), steps)
-                    sw.add_scalar('train/loss_mel', loss_mel    .item(), steps)
+                    sw.add_scalar('train/loss_mstft', loss_mstft.item(), steps)
 
                 if steps % a.save_interval == 0 and steps != 0:
                     fp_gen = f'{a.log_path}/g_{steps:08d}'
@@ -172,7 +149,7 @@ def train(rank:int, a:Namespace, h:Namespace):
                     fp_disc = f'{a.log_path}/do_{steps:08d}'
                     ckpt_disc = {
                         'mpd': (mpd.module if h.num_gpus > 1 else mpd).state_dict(),
-                        'msd': (msd.module if h.num_gpus > 1 else msd).state_dict(),
+                        'mrd': (mrd.module if h.num_gpus > 1 else mrd).state_dict(),
                         'optim_g': optim_g.state_dict(),
                         'optim_d': optim_d.state_dict(),
                         'steps': steps,
@@ -187,11 +164,12 @@ def train(rank:int, a:Namespace, h:Namespace):
 
                     loss_mel_val = 0.0
                     with torch.no_grad():
-                        for j, (x, y, y_mel) in enumerate(validloader):
-                            x     = x    .to(device, non_blocking=True)   # [B=1, M=80, L=32]
-                            y_mel = y_mel.to(device, non_blocking=True)   # [B=1, M=80, L=32]
+                        for j, (x, y, y_tmpl, y_mel) in enumerate(validloader):
+                            x      = x     .to(device, non_blocking=True)               # [B=1, M=80, L=32]
+                            y_tmpl = y_tmpl.to(device, non_blocking=True).unsqueeze(1)   # [B=1, C=1, T=8192]
+                            y_mel  = y_mel .to(device, non_blocking=True)               # [B=1, M=80, L=32]
 
-                            y_hat = generator(x)    # [B=1, C=1, T=8192]
+                            y_hat = generator(x, y_tmpl)    # [B=1, C=1, T=8192]
                             y_hat_mel = melspec_full(y_hat.squeeze(1))   # [B=1, M=80, L=32]
                             loss_mel_val += F.l1_loss(y_mel, y_hat_mel).item()
 
@@ -216,7 +194,7 @@ def train(rank:int, a:Namespace, h:Namespace):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('-c', '--config',     default='configs/config_v3.json')
+    parser.add_argument('-c', '--config',     default='configs/refinegan.json')
     parser.add_argument('--input_wavs_dir',   default='data/LJSpeech-1.1/wavs')
     parser.add_argument('--input_train_file', default='filelist/LJSpeech-1.1/training.txt')
     parser.add_argument('--input_valid_file', default='filelist/LJSpeech-1.1/validation.txt')
